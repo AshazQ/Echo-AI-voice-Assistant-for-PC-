@@ -28,7 +28,7 @@ from key import key_var
 pygame.mixer.init()
 
 # Gemini API Key configuration
-API_KEY = key_var
+API_KEY = key_var # User need to create another file for API key and assign it as a variable
 genai.configure(api_key=API_KEY)
 
 # Contextual memory (last 5 interactions)
@@ -518,4 +518,5 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = EchoWindow()
     window.show()
+
     sys.exit(app.exec())
