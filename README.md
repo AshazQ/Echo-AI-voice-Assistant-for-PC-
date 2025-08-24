@@ -13,8 +13,6 @@ It integrates **speech recognition, text-to-speech, AI APIs, and system automati
 - **Application Control** – Open/close apps, control volume, brightness  
 - **AI Integration** – Connects with Gemini API for smart responses  
 - **Context Memory** – Remembers last few interactions for continuity  
-- **Lightweight** – Runs offline for basic tasks (no heavy cloud dependency)  
-
 ---
 
 ## Tech Stack  
