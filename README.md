@@ -18,16 +18,8 @@ It integrates **speech recognition, text-to-speech, AI APIs, and system automati
 ## Tech Stack  
 
 - **Frontend (UI/UX):** Tkinter, CustomTkinter  
-- **Backend:** Python 3.x, SpeechRecognition, Pyttsx3, Gemini API, PyWin32 (optional)  
-- **Database:** SQLite (for reminders & history)  
+- **Backend:** Python 3.x, SpeechRecognition, Pyttsx3, Gemini API. 
 - **Version Control:** Git/GitHub  
-- **Editor:** VS Code / PyCharm  
+- **Editor:** PyCharm  
 
 ---
-
-## Installation  
-
-1. Clone this repository:  
-   ```bash
-   git clone https://github.com/<your-username>/Echo-Voice-Assistant.git
-   cd Echo-Voice-Assistant
