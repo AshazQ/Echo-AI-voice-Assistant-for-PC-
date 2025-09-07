@@ -5,7 +5,7 @@ It listens to your commands, responds with natural speech, and automates system 
 
 ---
 
-#Features  
+# Features  
 - **Voice Recognition** – Speech-to-text using `SpeechRecognition` (Google API)  
 - **Text-to-Speech** – Natural voice responses (Microsoft Edge TTS / pyttsx3)  
 - **Chat feature** - Can chat with the assistant.
@@ -44,5 +44,5 @@ It listens to your commands, responds with natural speech, and automates system 
 
 1. Clone the repo:  
    ```bash
-   git clone https://github.com/<your-username>/Echo-Voice-Assistant.git
+   git clone https://github.com/AshazQ/Echo-Voice-Assistant.git
    cd Echo-Voice-Assistant
