@@ -1,129 +1,171 @@
 import sys
+import os
+import threading
+import time
 import re
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QPushButton, QLabel, QDialog)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QTimer
-from PyQt6.QtGui import QFont
+import asyncio
+import datetime
+
+import wmi
 import speech_recognition as sr
 import pywhatkit
-import datetime
 import wikipedia
 import webbrowser
-import time
-import edge_tts
-import asyncio
-import google.generativeai as genai
 import subprocess
-import threading
 import psutil
 import pygame.mixer
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-from comtypes import CLSCTX_ALL
-import wmi
-from win10toast import ToastNotifier
 import requests
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QLabel, QWidget,
+    QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit,
+    QStackedWidget, QScrollArea
+)
+from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 
-from key import key_var
+# Optional module imports with availability flags
+try:
+    import edge_tts
 
-# Initialize pygame mixer
-pygame.mixer.init()
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
 
-# Gemini API Key configuration
-API_KEY = key_var # User need to create another file for API key and assign it as a variable
-genai.configure(api_key=API_KEY)
+try:
+    import google.generativeai as genai
 
-# Contextual memory (last 5 interactions)
-context_memory = []
+    try:
+        from core.key import key_var
+
+        genai.configure(api_key=key_var)
+        GEMINI_AVAILABLE = True
+    except ImportError:
+        GEMINI_AVAILABLE = False
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    from comtypes import CLSCTX_ALL
+
+    VOLUME_CONTROL_AVAILABLE = True
+except ImportError:
+    VOLUME_CONTROL_AVAILABLE = False
+
+# Constants
 MEMORY_LIMIT = 5
-
-# Reminder storage
-reminders = []
-notifier = ToastNotifier()
-
-# Paths for opening specific applications
-app_paths = {
+APP_PATHS = {
     "notepad": "notepad.exe",
     "calculator": "calc.exe",
+    "chrome": "chrome.exe",
+    "firefox": "firefox.exe",
+}
+INTENT_CATEGORIES = {
+    "media_control": ["play", "music", "song", "youtube"],
+    "time_date": ["time", "date", "day", "today"],
+    "information": ["tell me about", "who is", "what is", "explain", "search", "look up"],
+    "system_control": ["open", "close", "volume", "brightness"],
+    "weather": ["weather", "temperature", "forecast"],
+    "ai_chat": ["general conversation"]
 }
 
-# Global flags
+# Global variables
+pygame.mixer.init()
+loop = asyncio.new_event_loop()
+context_memory = []
 is_speaking = False
 interrupt_flag = threading.Event()
-wake_word_detected = False
-loop = asyncio.new_event_loop()
 
-# Set asyncio loop in a separate thread
+
 def run_asyncio_loop():
+    """Run asyncio event loop in a separate thread."""
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
+
 threading.Thread(target=run_asyncio_loop, daemon=True).start()
 
-# Filter unwanted formatting from text
-def filter_text(text):
+
+def filter_text(text: str) -> str:
+    """Clean text for TTS by removing markdown and special characters."""
     text = re.sub(r'\*\*.*?\*\*|\*.*?\*|`.*?`', lambda m: m.group(0)[1:-1], text)
     text = re.sub(r'[\n\r]+', ' ', text)
     text = re.sub(r'[^a-zA-Z0-9.,!?\'" ]', '', text)
-    text = ' '.join(text.split())
-    return text
+    return ' '.join(text.split())
 
-async def talk(text):
+
+async def text_to_speech(text: str, callback=None) -> None:
+    """Convert text to speech using edge-tts."""
     global is_speaking
-    clean_text = filter_text(text)
-    voice = "en-US-JennyNeural"
-    tts = edge_tts.Communicate(clean_text, voice, rate="+25%")
-    audio_file = f"response_{int(time.time())}.mp3"
-    print(f"Generating audio: {audio_file} with text: {clean_text}")
-    await tts.save(audio_file)
+    if not TTS_AVAILABLE:
+        if callback:
+            callback(f"TTS: {text}")
+        return
 
-    is_speaking = True
-    interrupt_flag.clear()
+    try:
+        clean_text = filter_text(text)
+        voice = "en-US-JennyNeural"
+        tts = edge_tts.Communicate(clean_text, voice, rate="+15%")
+        audio_file = f"response_{int(time.time())}.mp3"
+        await tts.save(audio_file)
+        is_speaking = True
+        interrupt_flag.clear()
+        if callback:
+            callback(" ")
+        pygame.mixer.music.load(audio_file)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            if interrupt_flag.is_set():
+                pygame.mixer.music.stop()
+                break
+            await asyncio.sleep(0.1)
+        is_speaking = False
+        try:
+            os.remove(audio_file)
+        except:
+            pass
+    except Exception as e:
+        if callback:
+            callback(f"TTS Error: {text}")
 
-    pygame.mixer.music.load(audio_file)
-    pygame.mixer.music.play()
-    print("Speaking...")
 
-    while pygame.mixer.music.get_busy():
-        if interrupt_flag.is_set():
-            pygame.mixer.music.stop()
-            print("Speech interrupted")
-            break
-        await asyncio.sleep(0.001)
+def ask_gemini(prompt: str) -> str:
+    """Query Gemini AI model with context-aware prompt."""
+    if not GEMINI_AVAILABLE:
+        return "Gemini AI is not available. Please install google-generativeai and add your API key."
 
-    is_speaking = False
-    print("Finished speaking")
-
-def get_day_date():
-    return datetime.datetime.now().strftime("%A, %B %d, %Y")
-
-def ask_gemini(prompt):
     try:
         model = genai.GenerativeModel("gemini-2.0-flash")
         system_prompt = """
-You are an advanced, context-aware AI assistant named Echo, designed to deliver precise, insightful, and efficient responses. Your primary goal is to provide clear, intelligent, and engaging answers while maintaining brevity and relevance. Follow these principles:
-- Adapt to Context & Mood: Align your tone with the user’s mood and the nature of the conversation—whether casual, professional, or highly technical.
-- Be Concise, Yet Complete: Deliver well-structured responses that are neither too short nor unnecessarily verbose. Prioritize clarity and depth without over-explaining.
-- No Redundancy: Avoid repeating information or your name ("Echo") unless necessary for clarity or emphasis.
-- Ask Smart Questions: If a query lacks clarity, request precise details with a brief, targeted question.
-- Ensure Logical Flow: Keep responses interconnected, ensuring a seamless and engaging dialogue.
-- Encourage Exploration: When relevant, subtly suggest related ideas or next steps to enhance the user's understanding.
-- Prioritize Accuracy & Relevance: Always provide well-reasoned, factual, and contextually appropriate responses.
-Your mission: Deliver an exceptional user experience with every interaction. Avoid starting responses with "Echo" or self-referential phrases unless explicitly asked about your identity.
+            You are an advanced, context-aware AI assistant named Echo, designed to deliver precise, insightful, and efficient responses. Your primary goal is to provide clear, intelligent, and engaging answers while maintaining brevity and relevance. Follow these principles:
+            - Adapt to Context & Mood: Align your tone with the user's mood and the nature of the conversation—whether casual, professional, or highly technical.
+            - Be Concise, Yet Complete: Deliver well-structured responses that are neither too short nor unnecessarily verbose. Prioritize clarity and depth without over-explaining.
+            - No Redundancy: Avoid repeating information or your name ("Echo") unless necessary for clarity or emphasis.
+            - Ask Smart Questions: If a query lacks clarity, request precise details with a brief, targeted question.
+            - Ensure Logical Flow: Keep responses interconnected, ensuring a seamless and engaging dialogue.
+            - Encourage Exploration: When relevant, subtly suggest related ideas or next steps to enhance the user's understanding.
+            - Prioritize Accuracy & Relevance: Always provide well-reasoned, factual, and contextually appropriate responses.
+            Your mission: Deliver an exceptional user experience with every interaction. Avoid starting responses with "Echo" or self-referential phrases unless explicitly asked about your identity.
         """
         memory_context = "\n".join(context_memory)
-        response = model.generate_content(f"{system_prompt}\n{memory_context}\nUser: {prompt}")
+        full_prompt = f"{system_prompt}\n{memory_context}\nUser: {prompt}"
+        response = model.generate_content(full_prompt)
         formatted_response = response.text.strip() if response.text else "I couldn't process that."
-
-        context_memory.append(f"User: {prompt}\nAssistant: {formatted_response}")
+        context_memory.append(f"User: {prompt}\nEcho: {formatted_response}")
         if len(context_memory) > MEMORY_LIMIT:
             context_memory.pop(0)
-
-        print(f"Assistant response: {formatted_response}")
         return formatted_response
     except Exception as e:
-        print(f"Gemini error: {e}")
-        return "I couldn't process that."
+        return f"I'm having trouble connecting to my AI service. Error: {str(e)}"
 
-def close_application(app_name):
+
+def get_day_date() -> str:
+    """Return the current day and date."""
+    return datetime.datetime.now().strftime("%A, %B %d, %Y")
+
+
+def close_application(app_name: str) -> bool:
+    """Close the specified application."""
     closed = False
     for proc in psutil.process_iter():
         try:
@@ -134,389 +176,708 @@ def close_application(app_name):
             pass
     return closed
 
-def duckduckgo_search(query):
-    url = "http://api.duckduckgo.com/?q=" + query + "&format=json&no_redirect=1"
+
+def set_volume(level: int) -> bool:
+    """Set system volume to the specified level."""
+    if not VOLUME_CONTROL_AVAILABLE:
+        return False
+    try:
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = interface.QueryInterface(IAudioEndpointVolume)
+        volume.SetMasterVolumeLevelScalar(level / 100, None)
+        return True
+    except:
+        return False
+
+
+def set_brightness(level: int) -> bool:
+    """Set screen brightness to the specified level."""
+    try:
+        c = wmi.WMI(namespace='wmi')
+        methods = c.WmiMonitorBrightnessMethods()[0]
+        methods.WmiSetBrightness(level, 0)
+        return True
+    except Exception:
+        return False
+
+
+def identify_intent(command: str) -> str:
+    """Identify the intent of the user's command."""
+    command_lower = command.lower()
+    for intent, keywords in INTENT_CATEGORIES.items():
+        if any(keyword in command_lower for keyword in keywords):
+            return intent
+    return "ai_chat"
+
+
+def duckduckgo_search(query: str) -> str:
+    """Perform a search using DuckDuckGo API."""
+    url = f"http://api.duckduckgo.com/?q={query}&format=json&no_redirect=1"
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
         if data.get("AbstractText"):
             return data["AbstractText"]
-        elif data.get("RelatedTopics") and data["RelatedTopics"][0].get("Text"):
-            return data["RelatedTopics"][0]["Text"]
-        else:
-            return None
-    except Exception as e:
-        print(f"DuckDuckGo search error: {e}")
+        elif data.get("RelatedTopics") and data["RelatedTopics"]:
+            if data["RelatedTopics"][0].get("Text"):
+                return data["RelatedTopics"][0]["Text"]
+        return None
+    except Exception:
         return None
 
-def set_volume(level):
-    devices = AudioUtilities.GetSpeakers()
-    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-    volume = interface.QueryInterface(IAudioEndpointVolume)
-    volume.SetMasterVolumeLevelScalar(level / 100, None)
 
-def set_brightness(level):
-    c = wmi.WMI(namespace='wmi')
-    methods = c.WmiMonitorBrightnessMethods()[0]
-    methods.WmiSetBrightness(level, 0)
-
-def check_reminders():
-    while True:
-        now = time.time()
-        for reminder in reminders[:]:
-            if now >= reminder[1]:
-                notifier.show_toast("Reminder", reminder[0], duration=10)
-                asyncio.run_coroutine_threadsafe(talk(f"Reminder: {reminder[0]}"), loop)
-                reminders.remove(reminder)
-        time.sleep(1)
-
-threading.Thread(target=check_reminders, daemon=True).start()
-
-# Worker thread for voice recognition
 class VoiceWorker(QThread):
-    command_signal = pyqtSignal(str)
-    status_signal = pyqtSignal(str)
+    """Worker thread for handling voice recognition."""
+    transcribed = pyqtSignal(str, str)
+    response_ready = pyqtSignal(str)
+    status = pyqtSignal(str)
+    error = pyqtSignal(str)
 
-    def run(self):
-        global wake_word_detected
-        recognizer = sr.Recognizer()
-        with sr.Microphone() as source:
-            self.status_signal.emit("Calibrating noise reduction...")
-            recognizer.adjust_for_ambient_noise(source, duration=2)
-            self.status_signal.emit("Listening...")
-            while True:
-                try:
-                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=5)
-                    command = recognizer.recognize_google(audio).lower()
-                    print(f"Recognized: {command}")
-
-                    if "echo" in command and not wake_word_detected:
-                        wake_word_detected = True
-                        command = command.replace("echo", "").strip()
-                        if is_speaking:
-                            interrupt_flag.set()
-                        self.command_signal.emit(command if command else "")
-                    elif wake_word_detected:
-                        if is_speaking:
-                            interrupt_flag.set()
-                        self.command_signal.emit(command)
-                except sr.WaitTimeoutError:
-                    continue
-                except sr.UnknownValueError:
-                    print("Could not understand audio")
-                    continue
-                except sr.RequestError as e:
-                    self.status_signal.emit(f"Speech recognition error: {e}")
-                    print(f"Speech recognition error: {e}")
-                    continue
-
-# Floating Status Widget
-class StatusWidget(QMainWindow):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Echo Status")
-        self.setFixedSize(200, 150)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-
-        # Style
-        self.setStyleSheet("""
-            QMainWindow { background-color: #2b2b2b; border-radius: 10px; }
-            QLabel { color: #ffffff; font-size: 12px; padding: 5px; }
-        """)
-
-        # Position on right side
-        screen = QApplication.primaryScreen().geometry()
-        self.move(screen.width() - 210, screen.height() // 2)
-
-        # Main widget and layout
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        layout = QHBoxLayout(main_widget)
-        layout.setContentsMargins(5, 5, 5, 5)
-
-        # Status label
-        self.label = QLabel("Initializing...")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setFont(QFont("Helvetica", 12))
-        self.label.setWordWrap(True)
-        layout.addWidget(self.label)
-
-        # Timer for auto-hide
-        self.timer = QTimer(self)
-        self.timer.setSingleShot(True)
-        self.timer.timeout.connect(self.hide)
-
-        # Dragging support
-        self.old_pos = None
-
-    def show_status(self, text):
-        self.label.setText(text)
-        self.show()
-        self.raise_()
-        self.timer.start(5000)  # Hide after 5 seconds
-
-    def mousePressEvent(self, event):
-        self.old_pos = event.globalPosition().toPoint()
-
-    def mouseMoveEvent(self, event):
-        if self.old_pos is not None:
-            delta = event.globalPosition().toPoint() - self.old_pos
-            self.move(self.x() + delta.x(), self.y() + delta.y())
-            self.old_pos = event.globalPosition().toPoint()
-
-    def mouseReleaseEvent(self, event):
-        self.old_pos = None
-
-# Main GUI Window (Pill-shaped icon widget)
-class EchoWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Echo - AI Assistant")
-        self.setFixedSize(150, 70)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+        self.recognizer = sr.Recognizer()
+        self.microphone = None
 
-        # Style for pill shape and unified button look
-        self.setStyleSheet("""
-            QMainWindow { background-color: #2b2b2b; border-radius: 20px; }
-            QPushButton { background-color: #4a4a4a; color: #ffffff; border: none; border-radius: 10px; 
-                          padding: 4px; font-size: 16px; min-width: 32px; min-height: 32px; }
-            QPushButton:hover { background-color: #5a5a5a; }
+    def run(self):
+        """Main loop for voice recognition."""
+        self.status.emit("Initializing microphone...")
+        try:
+            self.microphone = sr.Microphone()
+            with self.microphone as source:
+                self.status.emit("Calibrating for ambient noise...")
+                self.recognizer.adjust_for_ambient_noise(source, duration=1)
+            self.recognizer.energy_threshold = 300
+            self.recognizer.dynamic_energy_threshold = True
+            self.recognizer.pause_threshold = 0.8
+            self.recognizer.phrase_threshold = 0.3
+            self.status.emit("Ready - Say something to Echo...")
+
+            while not self._stop_event.is_set():
+                if not self._pause_event.is_set():
+                    self.msleep(100)
+                    continue
+                try:
+                    with self.microphone as source:
+                        audio = self.recognizer.listen(
+                            source,
+                            timeout=1,
+                            phrase_time_limit=8
+                        )
+                    try:
+                        command = self.recognizer.recognize_google(audio).lower()
+                        if command.strip():
+                            intent = identify_intent(command)
+                            self.transcribed.emit(command, intent)
+                            response = self.process_command(command)
+                            self.response_ready.emit(response)
+                            self.status.emit("Listening...")
+                    except sr.UnknownValueError:
+                        self.status.emit("Could not understand. Try speaking more clearly.")
+                        continue
+                    except sr.RequestError as e:
+                        self.error.emit(f"Speech recognition error: {e}")
+                        continue
+                except sr.WaitTimeoutError:
+                    continue
+                except Exception as e:
+                    self.error.emit(f"Microphone error: {e}")
+                    break
+        except Exception as e:
+            self.error.emit(f"Failed to initialize microphone: {e}")
+        self.status.emit("Voice recognition stopped.")
+
+    def process_command(self, command: str) -> str:
+        """Process voice commands and return appropriate responses."""
+        try:
+            if "play" in command and any(word in command for word in ["song", "music", "on youtube", "youtube"]):
+                song = command.replace("play", "").replace("song", "").replace("music", "").replace("on youtube",
+                                                                                                    "").replace(
+                    "youtube", "").strip()
+                if song:
+                    try:
+                        pywhatkit.playonyt(song)
+                        return f"Playing {song} on YouTube"
+                    except:
+                        return f"Sorry, I couldn't play {song}"
+                return "What would you like me to play?"
+            elif "time" in command:
+                time_now = datetime.datetime.now().strftime('%I:%M %p')
+                return f"The current time is {time_now}"
+            elif "date" in command or "day" in command:
+                return f"Today is {get_day_date()}"
+            elif any(phrase in command for phrase in ["tell me about", "who is", "what is", "explain"]):
+                subject = command
+                for phrase in ["tell me about", "who is", "what is", "explain"]:
+                    subject = subject.replace(phrase, "").strip()
+                if subject:
+                    try:
+                        info = wikipedia.summary(subject, sentences=2)
+                        return info
+                    except wikipedia.exceptions.DisambiguationError:
+                        return f"There are multiple results for {subject}. Can you be more specific?"
+                    except wikipedia.exceptions.PageError:
+                        return f"I couldn't find information about {subject}"
+                return "What would you like to know about?"
+            elif "open" in command:
+                app_or_site = command.replace("open", "").strip()
+                if app_or_site in APP_PATHS:
+                    try:
+                        subprocess.Popen(APP_PATHS[app_or_site])
+                        return f"Opening {app_or_site}"
+                    except:
+                        return f"I couldn't open {app_or_site}"
+                else:
+                    try:
+                        if "." in app_or_site or any(
+                                site in app_or_site for site in ["google", "youtube", "facebook", "twitter"]):
+                            if not app_or_site.startswith("http"):
+                                app_or_site = f"https://{app_or_site}" if "." in app_or_site else f"https://www.{app_or_site}.com"
+                            webbrowser.open(app_or_site)
+                            return f"Opening {app_or_site} in browser"
+                        else:
+                            webbrowser.open(f"https://www.google.com/search?q={app_or_site}")
+                            return f"Searching for {app_or_site}"
+                    except:
+                        return f"I couldn't open {app_or_site}"
+            elif "close" in command:
+                app = command.replace("close", "").strip()
+                return f"Closed {app}" if close_application(app) else f"I couldn't find {app} to close"
+            elif "search" in command or "look up" in command:
+                query = command.replace("search", "").replace("look up", "").strip()
+                if query:
+                    result = duckduckgo_search(query)
+                    if result:
+                        return result[:200] + "..." if len(result) > 200 else result
+                    else:
+                        webbrowser.open(f"https://www.google.com/search?q={query}")
+                        return f"I couldn't find a quick answer, so I opened a search for {query}"
+                return "What would you like me to search for?"
+            elif "volume" in command:
+                try:
+                    if "set volume" in command or "volume to" in command:
+                        words = command.split()
+                        for word in words:
+                            if word.isdigit():
+                                level = int(word)
+                                if 0 <= level <= 100:
+                                    return f"Volume set to {level}%" if set_volume(
+                                        level) else "I couldn't change the volume"
+                                return "Volume must be between 0 and 100"
+                    elif "increase volume" in command or "volume up" in command:
+                        return "Volume increased" if set_volume(75) else "I couldn't increase the volume"
+                    elif "decrease volume" in command or "volume down" in command:
+                        return "Volume decreased" if set_volume(25) else "I couldn't decrease the volume"
+                    return "Please specify a volume level between 0 and 100"
+                except:
+                    return "I couldn't change the volume"
+            elif "brightness" in command:
+                try:
+                    if "set brightness" in command or "brightness to" in command:
+                        words = command.split()
+                        for word in words:
+                            if word.isdigit():
+                                level = int(word)
+                                if 0 <= level <= 100:
+                                    return f"Brightness set to {level}%" if set_brightness(
+                                        level) else "I couldn't change the brightness"
+                                return "Brightness must be between 0 and 100"
+                    elif "increase brightness" in command or "brightness up" in command:
+                        return "Brightness increased" if set_brightness(80) else "I couldn't increase the brightness"
+                    elif "decrease brightness" in command or "brightness down" in command:
+                        return "Brightness decreased" if set_brightness(30) else "I couldn't decrease the brightness"
+                    return "Please specify a brightness level between 0 and 100"
+                except:
+                    return "I couldn't change the brightness"
+            elif "weather" in command:
+                location = command.split(" in ")[-1].strip() if " in " in command else "current location"
+                webbrowser.open(f"https://www.google.com/search?q=weather+{location}")
+                return f"Opening weather information for {location}"
+            else:
+                return ask_gemini(command)
+        except Exception as e:
+            return f"Sorry, I encountered an error: {str(e)}"
+
+    def stop(self):
+        """Stop the voice worker thread."""
+        self._stop_event.set()
+
+    def pause(self):
+        """Pause voice recognition."""
+        self._pause_event.clear()
+
+    def resume(self):
+        """Resume voice recognition."""
+        self._pause_event.set()
+
+
+class VoiceScreen(QWidget):
+    """Widget for voice interaction mode."""
+    back_to_menu = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.worker = None
+        self.paused = False
+        self.scroll_area = None
+        self.init_ui()
+
+    def init_ui(self):
+        """Initialize the UI for voice mode."""
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(49, 32, 49, 32)
+        main_layout.setSpacing(0)
+
+        # Scroll area for conversation
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.3);
+                border-radius: 6px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255, 255, 255, 0.5);
+            }
         """)
 
-        # Center on screen
-        screen = QApplication.primaryScreen().geometry()
-        self.move((screen.width() - 150) // 2, (screen.height() - 70) // 2)
+        self.conversation_content = QWidget()
+        self.conversation_layout = QVBoxLayout(self.conversation_content)
+        self.conversation_layout.setSpacing(16)
+        self.conversation_layout.setContentsMargins(30, 20, 30, 20)
+        self.conversation_layout.addStretch()
+        self.conversation_content.setStyleSheet("background: transparent; border: none; border-radius: 15px;")
+        self.scroll_area.setWidget(self.conversation_content)
+        main_layout.addWidget(self.scroll_area, stretch=1)
 
-        # Main widget and layout
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        layout = QHBoxLayout(main_widget)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        # Bottom controls layout
+        bottom_layout = QHBoxLayout()
+        bottom_layout.setSpacing(20)
+        bottom_layout.setContentsMargins(0, 20, 0, 0)
+        bottom_layout.addStretch()
+
+        def create_circle_button(label: str) -> QPushButton:
+            """Create a circular button with consistent styling."""
+            btn = QPushButton(label)
+            btn.setFixedSize(80, 80)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #F7EA7D;
+                    color: #222;
+                    font-size: 18px;
+                    font-weight: 600;
+                    font-family: 'Segoe UI';
+                    border: none;
+                    border-radius: 40px;
+                }
+                QPushButton:hover { background-color: #FFF3A0; }
+                QPushButton:pressed { background-color: #F0E76B; }
+                QPushButton:disabled {
+                    background-color: rgba(247, 234, 125, 0.5);
+                    color: rgba(51, 51, 51, 0.5);
+                }
+            """)
+            return btn
 
         # Buttons
-        self.mic_button = QPushButton("🎤")
-        self.mic_button.clicked.connect(self.start_voice_recognition)
-        layout.addWidget(self.mic_button)
+        self.stop_btn = create_circle_button("■")
+        self.stop_btn.clicked.connect(self.handle_stop)
+        self.stop_btn.setEnabled(False)
+        bottom_layout.addWidget(self.stop_btn)
 
-        self.settings_button = QPushButton("⚙")
-        self.settings_button.clicked.connect(self.open_settings)
-        layout.addWidget(self.settings_button)
+        self.pause_btn = create_circle_button("II")
+        self.pause_btn.clicked.connect(self.handle_pause)
+        self.pause_btn.setEnabled(False)
+        bottom_layout.addWidget(self.pause_btn)
 
-        self.stop_button = QPushButton("■")
-        self.stop_button.clicked.connect(self.stop_speech)
-        layout.addWidget(self.stop_button)
+        self.mic_btn = create_circle_button("🎤")
+        self.mic_btn.clicked.connect(self.handle_start)
+        bottom_layout.addWidget(self.mic_btn)
 
-        # Voice worker
-        self.voice_worker = VoiceWorker()
-        self.voice_worker.command_signal.connect(self.process_command)
-        self.voice_worker.status_signal.connect(self.show_status)
+        main_layout.addLayout(bottom_layout)
 
-        # Status widget
-        self.status_widget = StatusWidget(self)
-        self.status_widget.show_status("Say 'Echo' to start...")
+        # Back to menu button
+        back_btn = QPushButton("Back to Menu")
+        back_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.15);
+                color: white;
+                font-size: 20px;
+                font-family: 'Segoe UI';
+                font-weight: 500;
+                border: 2px solid white;
+                border-radius: 27px;
+                padding: 12px 36px;
+                min-width: 200px;
+            }
+            QPushButton:hover { background-color: rgba(255, 255, 255, 0.25); }
+            QPushButton:pressed { background-color: rgba(255, 255, 255, 0.35); }
+        """)
+        back_btn.clicked.connect(self.back_to_menu.emit)
+        main_layout.addWidget(back_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Dragging support
-        self.old_pos = None
+        QTimer.singleShot(100, self.add_welcome_message)
 
-    def start_voice_recognition(self):
-        if not self.voice_worker.isRunning():
-            self.voice_worker.start()
-            self.mic_button.setStyleSheet("background-color: #ff5555; border-radius: 10px; font-size: 16px; min-width: 32px; min-height: 32px;")
-            print("Voice recognition started")
+    def add_welcome_message(self):
+        """Display the welcome message."""
+        self.add_conversation_item("Welcome! Press 'Mic' to start voice conversation.", is_user=False)
+
+    def add_conversation_item(self, text: str, is_user: bool = True):
+        """Add a conversation item to the UI."""
+        item_widget = QWidget()
+        item_layout = QHBoxLayout(item_widget)
+        item_layout.setContentsMargins(0, 0, 0, 0)
+        item_layout.setSpacing(0)
+
+        bubble = QLabel(text)
+        bubble.setWordWrap(True)
+        bubble.setFont(QFont("Segoe UI", 17))
+        bubble.setMinimumHeight(36)
+        bubble_style = """
+            background: rgba(255, 255, 255, 0.3);
+            color: #000;
+            border-radius: 22px;
+            padding: 14px 24px;
+        """
+        bubble.setStyleSheet(bubble_style)
+        bubble.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter if is_user else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        item_layout.addStretch() if is_user else item_layout.addWidget(bubble)
+        if is_user:
+            item_layout.addWidget(bubble)
         else:
-            self.voice_worker.terminate()
-            self.mic_button.setStyleSheet("background-color: #4a4a4a; border-radius: 10px; font-size: 16px; min-width: 32px; min-height: 32px;")
-            self.status_widget.show_status("Stopped")
-            print("Voice recognition stopped")
+            item_layout.addStretch()
 
-    def stop_speech(self):
+        self.conversation_layout.insertWidget(self.conversation_layout.count() - 1, item_widget)
+        QTimer.singleShot(50, self.scroll_to_bottom)
+
+    def scroll_to_bottom(self):
+        """Scroll to the bottom of the conversation area."""
+        if self.scroll_area and self.scroll_area.verticalScrollBar():
+            scrollbar = self.scroll_area.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    def handle_start(self):
+        """Start the voice recognition worker."""
+        if self.worker and self.worker.isRunning():
+            return
+        self.worker = VoiceWorker()
+        self.worker.transcribed.connect(self.on_transcribed)
+        self.worker.response_ready.connect(self.on_response)
+        self.worker.status.connect(self.on_status)
+        self.worker.error.connect(self.on_error)
+        self.worker.start()
+        self.mic_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.paused = False
+
+    def handle_pause(self):
+        """Pause or resume voice recognition."""
+        if not self.worker:
+            return
+        if not self.paused:
+            self.worker.pause()
+            self.pause_btn.setText("▶")
+            self.paused = True
+        else:
+            self.worker.resume()
+            self.pause_btn.setText("II")
+            self.paused = False
+
+    def handle_stop(self):
+        """Stop the voice recognition worker."""
         global interrupt_flag
         interrupt_flag.set()
-        self.status_widget.show_status("Speech stopped")
-        print("Stop button pressed")
+        if self.worker:
+            self.worker.stop()
+            self.worker.wait(3000)
+        self.mic_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("II")
+        self.stop_btn.setEnabled(False)
 
-    def show_status(self, status):
-        self.status_widget.show_status(status)
+    def on_transcribed(self, text: str, intent: str):
+        """Handle transcribed voice input."""
+        self.add_conversation_item(text, is_user=True)
 
-    def process_command(self, command):
-        self.status_widget.show_status(f"You: {command}")
-        asyncio.run_coroutine_threadsafe(self.process_command_async(command), loop)
+    def on_response(self, response: str):
+        """Handle response from voice worker."""
+        self.add_conversation_item(response, is_user=False)
+        asyncio.run_coroutine_threadsafe(text_to_speech(response), loop)
 
-    def mousePressEvent(self, event):
-        self.old_pos = event.globalPosition().toPoint()
+    def on_status(self, status: str):
+        """Handle status updates (currently unused)."""
+        pass
 
-    def mouseMoveEvent(self, event):
-        if self.old_pos is not None:
-            delta = event.globalPosition().toPoint() - self.old_pos
-            self.move(self.x() + delta.x(), self.y() + delta.y())
-            self.old_pos = event.globalPosition().toPoint()
+    def on_error(self, error: str):
+        """Handle errors from voice worker."""
+        self.add_conversation_item(f"Error: {error}", is_user=False)
 
-    def mouseReleaseEvent(self, event):
-        self.old_pos = None
 
-    async def process_command_async(self, command):
-        global wake_word_detected
-        if not command:
+class ChatScreen(QWidget):
+    """Widget for text-based chat mode."""
+    back_to_menu = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+
+    def init_ui(self):
+        """Initialize the UI for chat mode."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(50, 50, 50, 50)
+
+        title = QLabel("Chat Mode - Text Conversation")
+        title.setFont(QFont("Segoe UI", 36, QFont.Weight.Bold))
+        title.setStyleSheet("color: white; margin-bottom: 30px;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        self.chat_area = QTextEdit()
+        self.chat_area.setStyleSheet("""
+            QTextEdit {
+                background: rgba(255, 255, 255, 0.1);
+                color: white;
+                font-size: 18px;
+                font-family: 'Segoe UI';
+                border: 2px solid rgba(255, 255, 255, 0.3);
+                border-radius: 15px;
+                padding: 20px;
+            }
+        """)
+        self.chat_area.setReadOnly(True)
+        layout.addWidget(self.chat_area, stretch=1)
+
+        input_layout = QHBoxLayout()
+        self.input_field = QTextEdit()
+        self.input_field.setMaximumHeight(100)
+        self.input_field.setStyleSheet("""
+            QTextEdit {
+                background: rgba(255, 255, 255, 0.9);
+                color: #333;
+                font-size: 16px;
+                font-family: 'Segoe UI';
+                border: none;
+                border-radius: 10px;
+                padding: 15px;
+            }
+        """)
+        self.input_field.setPlaceholderText("Type your message here...")
+        input_layout.addWidget(self.input_field)
+
+        send_btn = QPushButton("Send")
+        send_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #F7EA7D;
+                color: #333;
+                font-size: 18px;
+                font-family: 'Segoe UI';
+                font-weight: 600;
+                border: none;
+                border-radius: 30px;
+                padding: 15px 30px;
+                min-width: 60px;
+            }
+            QPushButton:hover {
+                background-color: #FFF3A0;
+            }
+        """)
+        send_btn.clicked.connect(self.send_message)
+        input_layout.addWidget(send_btn)
+        layout.addLayout(input_layout)
+
+        back_btn = QPushButton("Back to Menu")
+        back_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.15);
+                color: white;
+                font-size: 20px;
+                font-family: 'Segoe UI';
+                font-weight: 500;
+                border: 2px solid white;
+                border-radius: 27px;
+                padding: 12px 36px;
+                min-width: 200px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.25);
+            }
+            QPushButton:pressed {
+                background-color: rgba(255, 255, 255, 0.35);
+            }
+        """)
+        back_btn.clicked.connect(self.back_to_menu.emit)
+        layout.addWidget(back_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.chat_area.append("Welcome to Chat Mode! Type your questions below and I'll respond using AI.")
+
+    def send_message(self):
+        """Send a text message and display the response."""
+        message = self.input_field.toPlainText().strip()
+        if not message:
             return
+        self.chat_area.append(f"\nYou: {message}")
+        self.input_field.clear()
+        response = ask_gemini(message)
+        self.chat_area.append(f"\nEcho: {response}")
+        cursor = self.chat_area.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.chat_area.setTextCursor(cursor)
 
-        self.status_widget.show_status("Processing...")
-        print(f"Processing command: {command}")
-        if "play" in command:
-            song = command.replace("play", "").strip()
-            response = f"Playing {song} on YouTube"
-            self.status_widget.show_status(response)
-            await talk(response)
-            pywhatkit.playonyt(song)
-        elif "time" in command:
-            time_now = datetime.datetime.now().strftime('%I:%M %p')
-            response = f"The current time is {time_now}"
-            self.status_widget.show_status(response)
-            await talk(response)
-        elif "date" in command or "day" in command:
-            date = get_day_date()
-            response = f"Today's date is {date}"
-            self.status_widget.show_status(response)
-            await talk(response)
-        elif "tell me about" in command or "who is" in command or "what is" in command:
-            subject = command.replace("tell me about", "").replace("who is", "").replace("what is", "").strip()
-            try:
-                info = wikipedia.summary(subject, sentences=2)
-                self.status_widget.show_status(info)
-                await talk(info)
-            except wikipedia.exceptions.DisambiguationError:
-                response = "There are multiple results. Can you be more specific?"
-                self.status_widget.show_status(response)
-                await talk(response)
-            except wikipedia.exceptions.PageError:
-                response = "I couldn't find anything on that topic."
-                self.status_widget.show_status(response)
-                await talk(response)
-        elif "open" in command:
-            app_or_site = command.replace("open", "").strip()
-            if app_or_site in app_paths:
-                response = f"Opening {app_or_site}"
-                self.status_widget.show_status(response)
-                await talk(response)
-                subprocess.Popen(app_paths[app_or_site])
-            else:
-                response = f"Opening {app_or_site} on browser"
-                self.status_widget.show_status(response)
-                await talk(response)
-                if "." in app_or_site:
-                    webbrowser.open(f"https://{app_or_site}")
-                else:
-                    webbrowser.open(f"https://www.google.com/search?q={app_or_site}")
-        elif "close" in command:
-            app = command.replace("close", "").strip()
-            if close_application(app):
-                response = f"Closed all instances matching {app}"
-                self.status_widget.show_status(response)
-                await talk(response)
-            else:
-                response = f"Couldn't find any app matching {app} to close"
-                self.status_widget.show_status(response)
-                await talk(response)
-        elif "search" in command:
-            query = command.replace("search", "").strip()
-            result = duckduckgo_search(query)
-            if result:
-                self.status_widget.show_status(result)
-                await talk(result)
-            else:
-                response = f"No quick answer found. Opening {query} in browser."
-                self.status_widget.show_status(response)
-                await talk(response)
-                webbrowser.open(f"https://www.google.com/search?q={query}")
-        elif "set volume to" in command:
-            try:
-                level = int(command.split()[-1])
-                if 0 <= level <= 100:
-                    set_volume(level)
-                    response = f"Volume set to {level}%"
-                    self.status_widget.show_status(response)
-                    await talk(response)
-                else:
-                    response = "Volume must be between 0 and 100"
-                    self.status_widget.show_status(response)
-                    await talk(response)
-            except ValueError:
-                response = "Please specify a valid volume level"
-                self.status_widget.show_status(response)
-                await talk(response)
-        elif "set brightness to" in command:
-            try:
-                level = int(command.split()[-1])
-                if 0 <= level <= 100:
-                    set_brightness(level)
-                    response = f"Brightness set to {level}%"
-                    self.status_widget.show_status(response)
-                    await talk(response)
-                else:
-                    response = "Brightness must be between 0 and 100"
-                    self.status_widget.show_status(response)
-                    await talk(response)
-            except ValueError:
-                response = "Please specify a valid brightness level"
-                self.status_widget.show_status(response)
-                await talk(response)
-        elif "remind me" in command:
-            try:
-                message = command.replace("remind me to", "").split("in")[0].strip()
-                time_str = command.split("in")[-1].strip()
-                if "minute" in time_str:
-                    seconds = int(time_str.split()[0]) * 60
-                elif "hour" in time_str:
-                    seconds = int(time_str.split()[0]) * 3600
-                else:
-                    response = "I can only set reminders in minutes or hours"
-                    self.status_widget.show_status(response)
-                    await talk(response)
-                    return
-                reminders.append((message, time.time() + seconds))
-                response = f"Reminder set for {message} in {time_str}"
-                self.status_widget.show_status(response)
-                await talk(response)
-            except (IndexError, ValueError):
-                response = "Invalid format. Try 'Echo remind me to call John in 5 minutes'"
-                self.status_widget.show_status(response)
-                await talk(response)
-        elif "exit" in command or "stop" in command:
-            response = "Goodbye!"
-            self.status_widget.show_status(response)
-            await talk(response)
-            sys.exit()
-        else:
-            response = ask_gemini(command)
-            self.status_widget.show_status(response)
-            await talk(response)
 
-        self.status_widget.show_status("Listening...")
+class WelcomeScreen(QWidget):
+    """Widget for the welcome screen."""
+    chat_mode_clicked = pyqtSignal()
+    voice_mode_clicked = pyqtSignal()
 
-    def open_settings(self):
-        dialog = SettingsDialog(self)
-        dialog.exec()
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
 
-# Settings Dialog
-class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.setStyleSheet("background-color: #2b2b2b; color: #ffffff;")
-        layout = QHBoxLayout()
+    def init_ui(self):
+        """Initialize the UI for the welcome screen."""
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(80, 60, 80, 60)
+        main_layout.setSpacing(100)
 
-        voice_label = QLabel("Voice Selection (Coming Soon)")
-        layout.addWidget(voice_label)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setSpacing(30)
 
-        wake_label = QLabel("Wake Word: Echo (Fixed for now)")
-        layout.addWidget(wake_label)
+        welcome_title = QLabel("Welcome to Echo, your personal voice assistant.")
+        welcome_title.setFont(QFont("Segoe UI", 26, QFont.Weight.Bold))
+        welcome_title.setStyleSheet("color: white; line-height: 1.2;")
+        welcome_title.setWordWrap(True)
+        left_layout.addWidget(welcome_title)
 
-        self.setLayout(layout)
+        features_layout = QVBoxLayout()
+        features_layout.setSpacing(23)
+        feature1 = QLabel("• Simplify tasks with hands-free voice\n  commands.")
+        feature1.setFont(QFont("Segoe UI", 14))
+        feature1.setStyleSheet("color: white; line-height: 1.3;")
+        features_layout.addWidget(feature1)
+        feature2 = QLabel("• Access information, control media, and\n  launch apps.")
+        feature2.setFont(QFont("Segoe UI", 14))
+        feature2.setStyleSheet("color: white; line-height: 1.3;")
+        features_layout.addWidget(feature2)
+        left_layout.addLayout(features_layout)
+        left_layout.addStretch()
+        main_layout.addWidget(left_widget)
 
-# Main application
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setSpacing(40)
+        right_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        get_started_title = QLabel("Get Started....")
+        get_started_title.setFont(QFont("Segoe UI", 48, QFont.Weight.Normal))
+        get_started_title.setStyleSheet("color: white;")
+        get_started_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right_layout.addWidget(get_started_title)
+
+        button_style = """
+            QPushButton {
+                background-color: #F7EA7D;
+                color: #333;
+                font-size: 32px;
+                font-family: 'Segoe UI';
+                font-weight: 500;
+                border: none;
+                border-radius: 50px;
+                padding: 25px 50px;
+                min-width: 100px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: #FFF3A0;
+            }
+            QPushButton:pressed {
+                background-color: #F0E76B;
+            }
+        """
+
+        self.chat_mode_btn = QPushButton("Chat Mode")
+        self.chat_mode_btn.setStyleSheet(button_style)
+        self.chat_mode_btn.clicked.connect(self.chat_mode_clicked.emit)
+        right_layout.addWidget(self.chat_mode_btn)
+
+        self.voice_mode_btn = QPushButton("Voice Mode")
+        self.voice_mode_btn.setStyleSheet(button_style)
+        self.voice_mode_btn.clicked.connect(self.voice_mode_clicked.emit)
+        right_layout.addWidget(self.voice_mode_btn)
+        right_layout.addStretch()
+        main_layout.addWidget(right_widget)
+
+
+class VoiceWindow(QMainWindow):
+    """Main application window."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Echo - Advanced Voice Assistant")
+        self.setStyleSheet("""
+            QMainWindow {
+                background: qlineargradient(
+                    spread:pad, x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4B3A60,
+                    stop:0.25 #7851A9, 
+                    stop:0.75 #A48BCF,
+                    stop:1 #A48BCF
+                );
+            }
+        """)
+        self.center_on_screen()
+        self.stacked_widget = QStackedWidget()
+        self.setCentralWidget(self.stacked_widget)
+        self.welcome_screen = WelcomeScreen()
+        self.voice_screen = VoiceScreen()
+        self.chat_screen = ChatScreen()
+        self.stacked_widget.addWidget(self.welcome_screen)
+        self.stacked_widget.addWidget(self.voice_screen)
+        self.stacked_widget.addWidget(self.chat_screen)
+        self.welcome_screen.voice_mode_clicked.connect(self.show_voice_screen)
+        self.welcome_screen.chat_mode_clicked.connect(self.show_chat_screen)
+        self.voice_screen.back_to_menu.connect(self.show_welcome_screen)
+        self.chat_screen.back_to_menu.connect(self.show_welcome_screen)
+        self.stacked_widget.setCurrentWidget(self.welcome_screen)
+
+    def center_on_screen(self):
+        """Center the window on the screen."""
+        screen = QApplication.primaryScreen().availableGeometry()
+        window_geometry = self.geometry()
+        x = (screen.width() - window_geometry.width()) // 5
+        y = (screen.height() - window_geometry.height()) // 5
+        self.move(x, y)
+
+    def show_welcome_screen(self):
+        """Show the welcome screen."""
+        self.stacked_widget.setCurrentWidget(self.welcome_screen)
+
+    def show_voice_screen(self):
+        """Show the voice mode screen."""
+        self.stacked_widget.setCurrentWidget(self.voice_screen)
+
+    def show_chat_screen(self):
+        """Show the chat mode screen."""
+        self.stacked_widget.setCurrentWidget(self.chat_screen)
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = EchoWindow()
+    app.setStyle("Fusion")
+    window = VoiceWindow()
     window.show()
-
     sys.exit(app.exec())
