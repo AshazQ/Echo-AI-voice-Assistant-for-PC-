@@ -1,0 +1,10 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+key.py
+
+# IDE settings (optional, but keeps things cleaner)
+.idea/
